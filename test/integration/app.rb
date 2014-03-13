@@ -44,6 +44,23 @@ get '/send' do
   "ok"
 end
 
+get '/send_file' do
+  file = File.expand_path '../../views/a/in_a.str', __FILE__
+  send_file file
+end
+
+get '/streaming' do
+  headers['Content-Length'] = '46'
+  stream do |out|
+    out << "It's gonna be legen -\n"
+    sleep 0.5
+    out << " (wait for it) \n"
+    puts headers
+    sleep 1
+    out << "- dary!\n"
+  end
+end
+
 class Subclass < Sinatra::Base
   set :out, nil
   get '/subclass/async' do

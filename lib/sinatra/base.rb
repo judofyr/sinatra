@@ -22,8 +22,12 @@ module Sinatra
     # Returns an array of acceptable media types for the response
     def accept
       @env['sinatra.accept'] ||= begin
-        entries = @env['HTTP_ACCEPT'].to_s.scan(HEADER_VALUE_WITH_PARAMS)
-        entries.map { |e| AcceptEntry.new(e) }.sort
+        if @env.include? 'HTTP_ACCEPT' and @env['HTTP_ACCEPT'].to_s != ''
+          @env['HTTP_ACCEPT'].to_s.scan(HEADER_VALUE_WITH_PARAMS).
+            map! { |e| AcceptEntry.new(e) }.sort
+        else
+          [AcceptEntry.new('*/*')]
+        end
       end
     end
 
@@ -70,7 +74,7 @@ module Sinatra
       attr_accessor :params
 
       def initialize(entry)
-        params = entry.scan(HEADER_PARAM).map do |s|
+        params = entry.scan(HEADER_PARAM).map! do |s|
           key, value = s.strip.split('=', 2)
           value = value[1..-2].gsub(/\\(.)/, '\1') if value.start_with?('"')
           [key, value]
@@ -79,7 +83,7 @@ module Sinatra
         @entry  = entry
         @type   = entry[/[^;]+/].delete(' ')
         @params = Hash[params]
-        @q      = @params.delete('q') { "1.0" }.to_f
+        @q      = @params.delete('q') { 1.0 }.to_f
       end
 
       def <=>(other)
@@ -114,6 +118,7 @@ module Sinatra
   # http://rack.rubyforge.org/doc/classes/Rack/Response.html
   # http://rack.rubyforge.org/doc/classes/Rack/Response/Helpers.html
   class Response < Rack::Response
+    DROP_BODY_RESPONSES = [204, 205, 304]
     def initialize(*)
       super
       headers['Content-Type'] ||= 'text/html'
@@ -161,7 +166,7 @@ module Sinatra
     end
 
     def drop_body?
-      [204, 205, 304].include?(status.to_i)
+      DROP_BODY_RESPONSES.include?(status.to_i)
     end
   end
 
@@ -233,7 +238,7 @@ module Sinatra
         def block.each; yield(call) end
         response.body = block
       elsif value
-        headers.delete 'Content-Length' unless request.head?
+        headers.delete 'Content-Length' unless request.head? || value.is_a?(Rack::File) || value.is_a?(Stream)
         response.body = value
       else
         response.body
@@ -361,6 +366,7 @@ module Sinatra
       result    = file.serving env
       result[1].each { |k,v| headers[k] ||= v }
       headers['Content-Length'] = result[1]['Content-Length']
+      opts[:status] &&= Integer(opts[:status])
       halt opts[:status] || result[0], result[2]
     rescue Errno::ENOENT
       not_found
@@ -453,7 +459,7 @@ module Sinatra
       hash.each do |key, value|
         key = key.to_s.tr('_', '-')
         value = value.to_i if key == "max-age"
-        values << [key, value].join('=')
+        values << "#{key}=#{value}"
       end
 
       response['Cache-Control'] = values.join(', ') if values.any?
@@ -512,6 +518,7 @@ module Sinatra
     rescue ArgumentError
     end
 
+    ETAG_KINDS = [:strong, :weak]
     # Set the response entity tag (HTTP 'ETag' header) and halt if conditional
     # GET matches. The +value+ argument is an identifier that uniquely
     # identifies the current version of the resource. The +kind+ argument
@@ -527,12 +534,12 @@ module Sinatra
       kind         = options[:kind] || :strong
       new_resource = options.fetch(:new_resource) { request.post? }
 
-      unless [:strong, :weak].include?(kind)
+      unless ETAG_KINDS.include?(kind)
         raise ArgumentError, ":strong or :weak expected"
       end
 
       value = '"%s"' % value
-      value = 'W/' + value if kind == :weak
+      value = "W/#{value}" if kind == :weak
       response['ETag'] = value
 
       if success? or status == 304
@@ -776,7 +783,7 @@ module Sinatra
     def render(engine, data, options = {}, locals = {}, &block)
       # merge app-level options
       engine_options  = settings.respond_to?(engine) ? settings.send(engine) : {}
-      options         = engine_options.merge(options)
+      options.merge!(engine_options) { |key, v1, v2| v1 }
 
       # extract generic options
       locals          = options.delete(:locals) || locals         || {}
@@ -784,7 +791,7 @@ module Sinatra
       layout          = options[:layout]
       layout          = false if layout.nil? && options.include?(:layout)
       eat_errors      = layout.nil?
-      layout          = engine_options[:layout] if layout.nil? or layout == true
+      layout          = engine_options[:layout] if layout.nil? or (layout == true && engine_options[:layout] != false)
       layout          = @default_layout         if layout.nil? or layout == true
       layout_options  = options.delete(:layout_options) || {}
       content_type    = options.delete(:content_type)   || options.delete(:default_content_type)
@@ -808,8 +815,8 @@ module Sinatra
 
       # render layout
       if layout
-        options = options.merge(:views => views, :layout => false, :eat_errors => eat_errors, :scope => scope)
-        options.merge! layout_options
+        options.merge!(:views => views, :layout => false, :eat_errors => eat_errors, :scope => scope).
+                merge!(layout_options)
         catch(:layout_missing) { return render(layout_engine, layout, options, locals) { output } }
       end
 
@@ -859,7 +866,7 @@ module Sinatra
     include Helpers
     include Templates
 
-    URI = ::URI.const_defined?(:Parser) ? ::URI::Parser.new : ::URI
+    URI_INSTANCE = URI.const_defined?(:Parser) ? URI::Parser.new : URI
 
     attr_accessor :app, :env, :request, :response, :params
     attr_reader   :template_cache
@@ -951,10 +958,13 @@ module Sinatra
     def route!(base = settings, pass_block = nil)
       if routes = base.routes[@request.request_method]
         routes.each do |pattern, keys, conditions, block|
-          pass_block = process_route(pattern, keys, conditions) do |*args|
+          returned_pass_block = process_route(pattern, keys, conditions) do |*args|
             env['sinatra.route'] = block.instance_variable_get(:@route_name)
             route_eval { block[*args] }
           end
+
+          # don't wipe out pass_block in superclass
+          pass_block = returned_pass_block if returned_pass_block
         end
       end
 
@@ -981,7 +991,7 @@ module Sinatra
       route = @request.path_info
       route = '/' if route.empty? and not settings.empty_path_info?
       return unless match = pattern.match(route)
-      values += match.captures.to_a.map { |v| force_encoding URI.unescape(v) if v }
+      values += match.captures.map! { |v| force_encoding URI_INSTANCE.unescape(v) if v }
 
       if values.any?
         original, @params = params, params.merge('splat' => [], 'captures' => values)
@@ -1013,10 +1023,8 @@ module Sinatra
     # a matching file is found, returns nil otherwise.
     def static!
       return if (public_dir = settings.public_folder).nil?
-      public_dir = File.expand_path(public_dir)
-
-      path = File.expand_path(public_dir + unescape(request.path_info))
-      return unless path.start_with?(public_dir) and File.file?(path)
+      path = File.expand_path("#{public_dir}#{unescape(request.path_info)}" )
+      return unless File.file?(path)
 
       env['sinatra.static_file'] = path
       cache_control(*settings.static_cache_control) if settings.static_cache_control?
@@ -1387,7 +1395,7 @@ module Sinatra
 
       # Set configuration options for Sinatra and/or the app.
       # Allows scoping of settings for certain environments.
-      def configure(*envs, &block)
+      def configure(*envs)
         yield self if envs.empty? || envs.include?(environment.to_sym)
       end
 
@@ -1397,32 +1405,44 @@ module Sinatra
         @middleware << [middleware, args, block]
       end
 
-      def quit!(server, handler_name)
+      # Stop the self-hosted server if running.
+      def quit!
+        return unless running?
         # Use Thin's hard #stop! if available, otherwise just #stop.
-        server.respond_to?(:stop!) ? server.stop! : server.stop
-        $stderr.puts "\n== Sinatra has ended his set (crowd applauds)" unless handler_name =~/cgi/i
+        running_server.respond_to?(:stop!) ? running_server.stop! : running_server.stop
+        $stderr.puts "== Sinatra has ended his set (crowd applauds)" unless handler_name =~/cgi/i
+        set :running_server, nil
+        set :handler_name, nil
       end
+
+      alias_method :stop!, :quit!
 
       # Run the Sinatra app as a self-hosted server using
       # Thin, Puma, Mongrel, or WEBrick (in that order). If given a block, will call
       # with the constructed handler once we have taken the stage.
-      def run!(options = {})
+      def run!(options = {}, &block)
+        return if running?
         set options
         handler         = detect_rack_handler
         handler_name    = handler.name.gsub(/.*::/, '')
         server_settings = settings.respond_to?(:server_settings) ? settings.server_settings : {}
-        handler.run self, server_settings.merge(:Port => port, :Host => bind) do |server|
-          unless handler_name =~ /cgi/i
-            $stderr.puts "== Sinatra/#{Sinatra::VERSION} has taken the stage " +
-            "on #{port} for #{environment} with backup from #{handler_name}"
-          end
-          [:INT, :TERM].each { |sig| trap(sig) { quit!(server, handler_name) } }
-          server.threaded = settings.threaded if server.respond_to? :threaded=
-          set :running, true
-          yield server if block_given?
+        server_settings.merge!(:Port => port, :Host => bind)
+
+        begin
+          start_server(handler, server_settings, handler_name, &block)
+        rescue Errno::EADDRINUSE
+          $stderr.puts "== Someone is already performing on port #{port}!"
+          raise
+        ensure
+          quit!
         end
-      rescue Errno::EADDRINUSE
-        $stderr.puts "== Someone is already performing on port #{port}!"
+      end
+
+      alias_method :start!, :run!
+
+      # Check whether the self-hosted server is running or not.
+      def running?
+        running_server?
       end
 
       # The prototype instance used to process requests.
@@ -1468,6 +1488,38 @@ module Sinatra
       end
 
       private
+
+      # Starts the server by running the Rack Handler.
+      def start_server(handler, server_settings, handler_name)
+        handler.run(self, server_settings) do |server|
+          unless handler_name =~ /cgi/i
+            $stderr.puts "== Sinatra/#{Sinatra::VERSION} has taken the stage " +
+            "on #{port} for #{environment} with backup from #{handler_name}"
+          end
+
+          setup_traps
+          set :running_server, server
+          set :handler_name,   handler_name
+          server.threaded = settings.threaded if server.respond_to? :threaded=
+
+          yield server if block_given?
+        end
+      end
+
+      def setup_traps
+        if traps?
+          at_exit { quit! }
+
+          [:INT, :TERM].each do |signal|
+            old_handler = trap(signal) do
+              quit!
+              old_handler.call if old_handler.respond_to?(:call)
+            end
+          end
+
+          set :traps, false
+        end
+      end
 
       # Dynamically defines a method on settings.
       def define_singleton(name, content = Proc.new)
@@ -1572,7 +1624,7 @@ module Sinatra
               ignore << escaped(c).join if c.match(/[\.@]/)
               patt = encoded(c)
               patt.gsub(/%[\da-fA-F]{2}/) do |match|
-                match.split(//).map {|char| char =~ /[A-Z]/ ? "[#{char}#{char.tr('A-Z', 'a-z')}]" : char}.join
+                match.split(//).map! {|char| char =~ /[A-Z]/ ? "[#{char}#{char.tr('A-Z', 'a-z')}]" : char}.join
               end
             end
 
@@ -1617,14 +1669,14 @@ module Sinatra
       end
 
       def encoded(char)
-        enc = URI.escape(char)
+        enc = URI_INSTANCE.escape(char)
         enc = "(?:#{escaped(char, enc).join('|')})" if enc == char
         enc = "(?:#{enc}|#{encoded('+')})" if char == " "
         enc
       end
 
-      def escaped(char, enc = URI.escape(char))
-        [Regexp.escape(enc), URI.escape(char, /./)]
+      def escaped(char, enc = URI_INSTANCE.escape(char))
+        [Regexp.escape(enc), URI_INSTANCE.escape(char, /./)]
       end
 
       def safe_ignore(ignore)
@@ -1633,8 +1685,8 @@ module Sinatra
           unsafe_ignore << hex[1..2]
           ''
         end
-        unsafe_patterns = unsafe_ignore.map do |unsafe|
-          chars = unsafe.split(//).map do |char|
+        unsafe_patterns = unsafe_ignore.map! do |unsafe|
+          chars = unsafe.split(//).map! do |char|
             if char =~ /[A-Z]/
               char <<= char.tr('A-Z', 'a-z')
             end
@@ -1741,7 +1793,7 @@ module Sinatra
       # Like Kernel#caller but excluding certain magic entries
       def cleaned_caller(keep = 3)
         caller(1).
-          map    { |line| line.split(/:(?=\d|in )/, 3)[0,keep] }.
+          map!    { |line| line.split(/:(?=\d|in )/, 3)[0,keep] }.
           reject { |file, *_| CALLERS_TO_IGNORE.any? { |pattern| file =~ pattern } }
       end
     end
@@ -1800,7 +1852,9 @@ module Sinatra
     end
 
     set :run, false                       # start server via at-exit hook?
-    set :running, false                   # is the built-in server running now?
+    set :running_server, nil
+    set :handler_name, nil
+    set :traps, true
     set :server, %w[HTTP webrick]
     set :bind, Proc.new { development? ? 'localhost' : '0.0.0.0' }
     set :port, Integer(ENV['PORT'] && !ENV['PORT'].empty? ? ENV['PORT'] : 4567)
@@ -1810,11 +1864,12 @@ module Sinatra
     if ruby_engine == 'macruby'
       server.unshift 'control_tower'
     else
+      server.unshift 'reel'
       server.unshift 'mongrel'  if ruby_engine.nil?
       server.unshift 'puma'     if ruby_engine != 'rbx'
       server.unshift 'thin'     if ruby_engine != 'jruby'
       server.unshift 'puma'     if ruby_engine == 'rbx'
-      server.unshift 'trinidad' if ruby_engine =='jruby'
+      server.unshift 'trinidad' if ruby_engine == 'jruby'
     end
 
     set :absolute_redirects, true
@@ -1962,7 +2017,7 @@ module Sinatra
 
   # Create a new Sinatra application. The block is evaluated in the new app's
   # class scope.
-  def self.new(base = Base, options = {}, &block)
+  def self.new(base = Base, &block)
     base = Class.new(base)
     base.class_eval(&block) if block_given?
     base
